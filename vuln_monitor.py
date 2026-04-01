@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Vulnerability Monitor — Slack Alerting Bot
-Monitors: NVD/CVE, Exploit-DB, GitHub Security Advisories, Full Disclosure
+Monitors: NVD/CVE, Exploit-DB, GitHub Security Advisories,
+          Full Disclosure, Hacker News (security), CyberSecurityNews
 Posts new vulnerabilities to Slack with rich formatting.
 """
 
 import os
+import re
 import json
 import hashlib
 import logging
@@ -13,6 +15,7 @@ import requests
 import feedparser
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from html.parser import HTMLParser
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
@@ -180,6 +183,118 @@ def fetch_full_disclosure() -> list[dict]:
     return vulns
 
 
+# Security-related keywords to filter HN posts
+HN_SECURITY_KEYWORDS = [
+    "cve", "vulnerability", "vuln", "exploit", "rce", "zero-day", "0day",
+    "remote code", "sql injection", "xss", "buffer overflow", "privilege escalation",
+    "ransomware", "malware", "backdoor", "breach", "hack", "patch", "advisory",
+    "security flaw", "attack", "critical bug", "auth bypass", "injection",
+    "data leak", "exposure", "disclosure",
+]
+
+def fetch_hackernews() -> list[dict]:
+    """Hacker News Algolia API — security-related stories from the last hour"""
+    vulns = []
+    try:
+        # Search recent HN stories containing security keywords
+        cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=CHECK_HOURS_BACK)).timestamp())
+        url = (
+            "https://hn.algolia.com/api/v1/search_by_date"
+            f"?tags=story&numericFilters=created_at_i>{cutoff_ts}&hitsPerPage=50"
+            "&query=vulnerability+OR+exploit+OR+CVE+OR+zero-day+OR+security+breach"
+        )
+        r = requests.get(url, timeout=15, headers={"User-Agent": "vuln-monitor/1.0"})
+        r.raise_for_status()
+        data = r.json()
+
+        for hit in data.get("hits", []):
+            title = hit.get("title", "")
+            title_lower = title.lower()
+            # Filter: must contain at least one security keyword
+            if not any(kw in title_lower for kw in HN_SECURITY_KEYWORDS):
+                continue
+            story_url = hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID','')}"
+            hn_url = f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}"
+            points = hit.get("points", 0) or 0
+            comments = hit.get("num_comments", 0) or 0
+            desc = f"Points: {points} | Comments: {comments} | Discussion: {hn_url}"
+            vulns.append({
+                "id": make_id(hit.get("objectID", title)),
+                "title": title,
+                "description": desc,
+                "severity": "NEWS",
+                "cvss": "N/A",
+                "url": story_url,
+                "source": "Hacker News",
+                "source_emoji": "🟠",
+            })
+        log.info(f"Hacker News: found {len(vulns)} security stories")
+    except Exception as e:
+        log.error(f"Hacker News fetch error: {e}")
+    return vulns
+
+
+class _TextExtractor(HTMLParser):
+    """Strips HTML tags from a string."""
+    def __init__(self):
+        super().__init__()
+        self._parts = []
+    def handle_data(self, data):
+        self._parts.append(data)
+    def get_text(self):
+        return " ".join(self._parts).strip()
+
+def _strip_html(html: str) -> str:
+    p = _TextExtractor()
+    p.feed(html)
+    return p.get_text()
+
+
+def fetch_cybersecuritynews() -> list[dict]:
+    """CyberSecurityNews.com RSS feed"""
+    vulns = []
+    try:
+        feed = feedparser.parse("https://cybersecuritynews.com/feed/")
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=CHECK_HOURS_BACK)
+        for entry in feed.entries:
+            published = None
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            if published and published < cutoff:
+                continue
+
+            title = entry.get("title", "CyberSecurityNews article")
+            # Extract plain-text summary from HTML content
+            raw_summary = entry.get("summary", "") or ""
+            summary = _strip_html(raw_summary)[:300]
+            if not summary:
+                content = entry.get("content", [{}])[0].get("value", "")
+                summary = _strip_html(content)[:300]
+
+            # Infer severity from title keywords
+            severity = "NEWS"
+            title_up = title.upper()
+            if any(w in title_up for w in ["CRITICAL", "0-DAY", "ZERO-DAY", "RCE", "REMOTE CODE"]):
+                severity = "CRITICAL"
+            elif any(w in title_up for w in ["HIGH", "EXPLOIT", "RANSOMWARE", "BREACH"]):
+                severity = "HIGH"
+
+            vulns.append({
+                "id": make_id(entry.get("link", title)),
+                "title": title,
+                "description": summary or "_No description available_",
+                "severity": severity,
+                "cvss": "N/A",
+                "url": entry.get("link", "https://cybersecuritynews.com"),
+                "source": "CyberSecurityNews",
+                "source_emoji": "📰",
+            })
+        log.info(f"CyberSecurityNews: found {len(vulns)} entries")
+    except Exception as e:
+        log.error(f"CyberSecurityNews fetch error: {e}")
+    return vulns
+
+
 # ── Slack Formatting ──────────────────────────────────────────────────────────
 
 SEVERITY_COLOR = {
@@ -190,6 +305,7 @@ SEVERITY_COLOR = {
     "LOW":         "#36A64F",
     "UNKNOWN":     "#888888",
     "DISCLOSURE":  "#4A90D9",
+    "NEWS":        "#6B52AE",
     "⚠️ 0DAY/EXPLOIT": "#FF0000",
 }
 
@@ -201,6 +317,7 @@ SEVERITY_BADGE = {
     "LOW":         "🟢 LOW",
     "UNKNOWN":     "⚪ UNKNOWN",
     "DISCLOSURE":  "🔵 DISCLOSURE",
+    "NEWS":        "📰 NEWS",
     "⚠️ 0DAY/EXPLOIT": "💥 0DAY / EXPLOIT",
 }
 
@@ -271,10 +388,12 @@ def main():
     seen = load_seen()
 
     all_vulns = []
-    all_vulns += fetch_exploitdb()          # fastest 0day source first
-    all_vulns += fetch_github_advisories()  # real-time
-    all_vulns += fetch_full_disclosure()    # mailing list
-    all_vulns += fetch_nvd_cves(hours_back=CHECK_HOURS_BACK)  # authoritative
+    all_vulns += fetch_exploitdb()            # fastest — 0days & PoCs first
+    all_vulns += fetch_hackernews()           # fast — community picks up news early
+    all_vulns += fetch_cybersecuritynews()    # fast — dedicated security news site
+    all_vulns += fetch_github_advisories()   # real-time package advisories
+    all_vulns += fetch_full_disclosure()     # researcher mailing list
+    all_vulns += fetch_nvd_cves(hours_back=CHECK_HOURS_BACK)  # authoritative but slower
 
     new_count = 0
     for vuln in all_vulns:
