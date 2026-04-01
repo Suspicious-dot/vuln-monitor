@@ -1,0 +1,51 @@
+name: 🔐 Vulnerability Monitor
+
+on:
+  schedule:
+    # Runs every 15 minutes — fastest free polling on GitHub Actions
+    - cron: "*/15 * * * *"
+  workflow_dispatch:  # allows manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to commit seen_vulns.json state file
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore seen_vulns state
+        run: |
+          # Pull the latest state file if it exists in the repo
+          git pull --rebase || true
+
+      - name: Run vulnerability monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python vuln_monitor.py
+
+      - name: Commit updated state (deduplication)
+        run: |
+          git config user.name "vuln-monitor-bot"
+          git config user.email "bot@vuln-monitor"
+          git add seen_vulns.json || true
+          git diff --staged --quiet || git commit -m "chore: update seen vulns state [skip ci]"
+          git push || true
